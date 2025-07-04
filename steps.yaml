@@ -1,0 +1,141 @@
+Step 1: Create S3 Bucket (for storing logs)
+aws s3api create-bucket \
+  --bucket cw-log-archive-prod \
+  --region ap-south-1 \
+  --create-bucket-configuration LocationConstraint=ap-south-1
+
+🔹 Step 2: Create IAM Role for Lambda (with trust policy)
+File: trust-policy.json
+
+json
+Copy
+Edit
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "lambda.amazonaws.com"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+bash
+Copy
+Edit
+aws iam create-role \
+  --role-name cw-log-archival-lambda-role \
+  --assume-role-policy-document file://trust-policy.json
+
+🔹 Step 3: Attach IAM Policies
+bash
+Copy
+Edit
+aws iam attach-role-policy \
+  --role-name cw-log-archival-lambda-role \
+  --policy-arn arn:aws:iam::aws:policy/AmazonS3FullAccess
+
+aws iam attach-role-policy \
+  --role-name cw-log-archival-lambda-role \
+  --policy-arn arn:aws:iam::aws:policy/CloudWatchLogsReadOnlyAccess
+
+aws iam attach-role-policy \
+  --role-name cw-log-archival-lambda-role \
+  --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+🔹 Step 4: Create Lambda Function
+File: cw_log_archival_lambda.py
+
+python
+Copy
+Edit
+import boto3
+import gzip
+import json
+import os
+import time
+from datetime import datetime
+
+logs = boto3.client('logs')
+s3 = boto3.client('s3')
+bucket = 'cw-log-archive-prod'
+
+def lambda_handler(event, context):
+    log_groups = logs.describe_log_groups(limit=5)['logGroups']
+    for group in log_groups:
+        group_name = group['logGroupName']
+        timestamp = int(round(time.time() * 1000))
+        streams = logs.describe_log_streams(
+            logGroupName=group_name,
+            orderBy='LastEventTime',
+            descending=True,
+            limit=1
+        )
+        if not streams['logStreams']:
+            continue
+        stream = streams['logStreams'][0]['logStreamName']
+        log_events = logs.get_log_events(
+            logGroupName=group_name,
+            logStreamName=stream,
+            limit=50,
+            startFromHead=False
+        )
+
+        data = {
+            "logGroup": group_name,
+            "logStream": stream,
+            "events": log_events['events']
+        }
+
+        now = datetime.utcnow().strftime('%Y-%m-%dT%H-%M-%SZ')
+        key = f"{group_name.strip('/').replace('/', '_')}/{now}.json"
+        s3.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=json.dumps(data),
+            ContentType='application/json'
+        )
+    return {"status": "done"}
+
+Zip and Create Lambda
+zip function.zip cw_log_archival_lambda.py
+
+aws lambda create-function \
+  --function-name cw-log-archiver \
+  --runtime python3.10 \
+  --role arn:aws:iam::<your-account-id>:role/cw-log-archival-lambda-role \
+  --handler cw_log_archival_lambda.lambda_handler \
+  --timeout 60 \
+  --memory-size 256 \
+  --zip-file fileb://function.zip \
+  --region ap-south-1
+
+🔹 Step 5: Create CloudWatch Event Rule (for daily cron)
+bash
+Copy
+Edit
+aws events put-rule \
+  --name daily-log-archive-rule \
+  --schedule-expression "cron(0 0 * * ? *)" \
+  --region ap-south-1
+
+🔹 Step 6: Add Lambda permission for EventBridge
+bash
+Copy
+Edit
+aws lambda add-permission \
+  --function-name cw-log-archiver \
+  --statement-id allow-cloudwatch-events \
+  --action 'lambda:InvokeFunction' \
+  --principal events.amazonaws.com \
+  --source-arn arn:aws:events:ap-south-1:<your-account-id>:rule/daily-log-archive-rule
+
+🔹 Step 7: Connect Rule to Lambda
+bash
+Copy
+Edit
+aws events put-targets \
+  --rule daily-log-archive-rule \
+  --targets "Id"="1","Arn"="arn:aws:lambda:ap-south-1:<your-account-id>:function:cw-log-archiver"
